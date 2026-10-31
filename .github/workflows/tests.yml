@@ -2,9 +2,22 @@ name: Tests
 
 on:
   workflow_dispatch:
+    inputs:
+      launch_instances:
+        description: "Run live OCI tests that can create cloud instances and incur charges"
+        required: true
+        type: boolean
+        default: false
 
 jobs:
+  live-tests-skipped:
+    if: ${{ !inputs.launch_instances }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Live OCI tests were skipped. Enable launch_instances to run tests that can create instances."
+
   tests:
+    if: ${{ inputs.launch_instances }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
