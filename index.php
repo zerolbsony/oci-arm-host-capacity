@@ -48,6 +48,16 @@ foreach ([
 if (!is_readable(getenv('OCI_PRIVATE_KEY_FILENAME'))) {
     reportResult('failed', 'The OCI private key file is not readable.', 1);
 }
+if (
+    getenv('OCI_REGION') !== 'us-ashburn-1'
+    || getenv('OCI_SHAPE') !== 'VM.Standard.A1.Flex'
+    || (int) getenv('OCI_OCPUS') !== 1
+    || (int) getenv('OCI_MEMORY_IN_GBS') !== 6
+    || (int) getenv('OCI_BOOT_VOLUME_SIZE_IN_GBS') !== 50
+    || getenv('OCI_BOOT_VOLUME_ID')
+) {
+    reportResult('failed', 'Refusing to launch outside the approved Always Free profile: Ashburn A1, 1 OCPU, 6 GB memory, 50 GB boot volume.', 1);
+}
 
 /*
  * No need to modify any value in this file anymore!
