@@ -14,9 +14,40 @@ use Hitrov\OciApi;
 use Hitrov\OciConfig;
 use Hitrov\TooManyRequestsWaiter;
 
+function reportResult(string $status, string $message, int $exitCode = 0): void
+{
+    $message = preg_replace('/ocid1\.[a-zA-Z0-9._-]+/', '[redacted OCID]', $message);
+    echo "$status: $message\n";
+    if (getenv('GITHUB_OUTPUT')) {
+        file_put_contents(getenv('GITHUB_OUTPUT'), "result=$status\n", FILE_APPEND);
+    }
+    if (getenv('GITHUB_STEP_SUMMARY')) {
+        file_put_contents(getenv('GITHUB_STEP_SUMMARY'), "OCI result: **$status**\n\n$message\n", FILE_APPEND);
+    }
+    exit($exitCode);
+}
+
+set_exception_handler(function (Throwable $error): void {
+    reportResult('failed', $error->getMessage(), 1);
+});
+
 $envFilename = empty($argv[1]) ? '.env' : $argv[1];
 $dotenv = Dotenv::createUnsafeImmutable(__DIR__, $envFilename);
 $dotenv->safeLoad();
+
+foreach ([
+    'OCI_REGION', 'OCI_USER_ID', 'OCI_TENANCY_ID', 'OCI_KEY_FINGERPRINT',
+    'OCI_PRIVATE_KEY_FILENAME', 'OCI_SUBNET_ID', 'OCI_IMAGE_ID',
+    'OCI_OCPUS', 'OCI_MEMORY_IN_GBS', 'OCI_SHAPE', 'OCI_MAX_INSTANCES',
+    'OCI_SSH_PUBLIC_KEY',
+] as $requiredVariable) {
+    if (!getenv($requiredVariable)) {
+        reportResult('failed', "Missing required configuration: $requiredVariable", 1);
+    }
+}
+if (!is_readable(getenv('OCI_PRIVATE_KEY_FILENAME'))) {
+    reportResult('failed', 'The OCI private key file is not readable.', 1);
+}
 
 /*
  * No need to modify any value in this file anymore!
@@ -70,13 +101,15 @@ $maxRunningInstancesOfThatShape = 1;
 if (getenv('OCI_MAX_INSTANCES') !== false) {
     $maxRunningInstancesOfThatShape = (int) getenv('OCI_MAX_INSTANCES');
 }
+if ($maxRunningInstancesOfThatShape !== 1) {
+    reportResult('failed', 'This scheduled deployment requires OCI_MAX_INSTANCES=1.', 1);
+}
 
 $instances = $api->getInstances($config);
 
 $existingInstances = $api->checkExistingInstances($config, $instances, $shape, $maxRunningInstancesOfThatShape);
 if ($existingInstances) {
-    echo "$existingInstances\n";
-    return;
+    reportResult('already_exists', 'An active instance of the configured shape already exists. No instance was created.');
 }
 
 if (!empty($config->availabilityDomains)) {
@@ -88,38 +121,46 @@ if (!empty($config->availabilityDomains)) {
 } else {
     $availabilityDomains = $api->getAvailabilityDomains($config);
 }
+if (!$availabilityDomains) {
+    reportResult('failed', 'OCI returned no availability domains.', 1);
+}
 
 foreach ($availabilityDomains as $availabilityDomainEntity) {
     $availabilityDomain = is_array($availabilityDomainEntity) ? $availabilityDomainEntity['name'] : $availabilityDomainEntity;
+    echo "Checking availability domain $availabilityDomain\n";
     try {
         $instanceDetails = $api->createInstance($config, $shape, getenv('OCI_SSH_PUBLIC_KEY'), $availabilityDomain);
     } catch(ApiCallException $e) {
         $message = $e->getMessage();
-        echo "$message\n";
+        echo preg_replace('/ocid1\.[a-zA-Z0-9._-]+/', '[redacted OCID]', $message) . "\n";
 //            if ($notifier->isSupported()) {
 //                $notifier->notify($message);
 //            }
 
         if (
             $e->getCode() === 500 &&
-            strpos($message, 'InternalError') !== false &&
-            strpos($message, 'Out of host capacity') !== false
+            (stripos($message, 'Out of host capacity') !== false || stripos($message, 'Out of capacity') !== false)
         ) {
             // trying next availability domain
             sleep(16);
             continue;
         }
 
-        // current config is broken
-        return;
+        if ($e->getCode() === 429) {
+            reportResult('retry_later', 'OCI rate limited this attempt. A later scheduled run will retry.');
+        }
+
+        reportResult('failed', $message, 1);
     }
 
     // success
-    $message = json_encode($instanceDetails, JSON_PRETTY_PRINT);
-    echo "$message\n";
+    $message = 'OCI accepted the launch in ' . $availabilityDomain
+        . '. State: ' . ($instanceDetails['lifecycleState'] ?? 'PROVISIONING') . '.';
     if ($notifier->isSupported()) {
         $notifier->notify($message);
     }
 
-    return;
+    reportResult('created', $message);
 }
+
+reportResult('waiting_for_capacity', 'All availability domains are currently out of host capacity. A later scheduled run will retry.');

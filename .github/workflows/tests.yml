@@ -1,60 +1,74 @@
-name: Tests
+name: OCI ARM capacity
 
 on:
+  schedule:
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
     inputs:
       launch_instances:
-        description: "Run live OCI tests that can create cloud instances and incur charges"
+        description: 'Attempt to create the configured OCI instance'
         required: true
         type: boolean
         default: false
 
-jobs:
-  live-tests-skipped:
-    if: ${{ !inputs.launch_instances }}
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Live OCI tests were skipped. Enable launch_instances to run tests that can create instances."
+permissions:
+  contents: read
 
-  tests:
-    if: ${{ inputs.launch_instances }}
+concurrency:
+  group: oci-arm-capacity
+  cancel-in-progress: false
+
+jobs:
+  skipped:
+    if: github.event_name == 'workflow_dispatch' && !inputs.launch_instances
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        php-versions: ['8.3']
-    name: integration-tests (PHP ${{ matrix.php-versions }})
     steps:
-      - uses: actions/checkout@v1
+      - run: echo 'Enable launch_instances to attempt instance creation.'
+
+  provision:
+    if: github.event_name == 'schedule' || inputs.launch_instances
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: ${{ matrix.php-versions }}
-      - name: Validate composer.json and composer.lock
-        run: composer validate
+          php-version: '8.3'
+          extensions: curl, mbstring
+          tools: composer:v2
+          coverage: none
 
-      - name: Get Composer Cache Directory
-        id: composer-cache
+      - name: Validate dependency manifest and PHP syntax
         run: |
-          echo "::set-output name=dir::$(composer config cache-files-dir)"
-      - uses: actions/cache@v2
+          composer validate --no-check-publish
+          php -l index.php
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-${{ matrix.php-version }}-composer-${{ matrix.dependencies }}-${{ hashFiles('**/composer.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.php-version }}-composer-${{ matrix.dependencies }}-
+          key: ${{ runner.os }}-php83-composer-${{ hashFiles('composer.lock') }}
+          restore-keys: ${{ runner.os }}-php83-composer-
 
-      - name: Install dependencies
-        run: |
-          composer update --prefer-dist --no-progress
+      - name: Install locked production dependencies
+        run: composer install --no-dev --prefer-dist --no-progress --no-interaction
+
       - name: Write OCI private key
         env:
           OCI_PRIVATE_KEY_PEM: ${{ secrets.OCI_PRIVATE_KEY_PEM }}
         run: |
+          test -n "$OCI_PRIVATE_KEY_PEM"
+          umask 077
           printf '%s' "$OCI_PRIVATE_KEY_PEM" > "$RUNNER_TEMP/oci_api_key.pem"
-          chmod 600 "$RUNNER_TEMP/oci_api_key.pem"
-      - name: Run test suite
-        run: |
-          vendor/bin/phpunit --color tests/
+
+      - name: Check existing instances and attempt ARM launch
+        id: capacity
+        run: php index.php
         env:
           OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
@@ -69,5 +83,8 @@ jobs:
           OCI_SHAPE: ${{ secrets.OCI_SHAPE }}
           OCI_MAX_INSTANCES: ${{ secrets.OCI_MAX_INSTANCES }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
+          OCI_BOOT_VOLUME_SIZE_IN_GBS: '50'
+
+      - name: Remove runner private key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/oci_api_key.pem"
